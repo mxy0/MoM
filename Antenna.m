@@ -1,5 +1,5 @@
 classdef Antenna
-    properties
+    properties (Access = public)
         mu_0 = 4*pi*1e-7;       % vacuum permeability
         epi_0 = 8.854*1e-12;    % permittivity
         c                       % speed of light    
@@ -8,8 +8,7 @@ classdef Antenna
         N                       % how many segments to divide antenna into
         M = 6                   % number of sample points to take for triangle basis 
                                 % must be even
-                                % actually [0, M+1], but f(0)=f(M+1)=0 
-        cornerLimit = 0.01      % limit of antenna corner detection
+                                
         mu_r                    % relative permeability
         epi_r                   % relative permittivity
         k                       % wavenumber
@@ -21,27 +20,32 @@ classdef Antenna
         V                       % potential matrix along wire
         I                       % current distribution along wire
         ZWire                   % impedance per segment along wire
-        ind                     % antenna inductance
+        inputIm                 % input impedance
+        ind                     % antenna input inductance
         QFactor                 % q factor 
         del_l                   % segment length 
         a                       % wire radius
         
+        assump                  % assume end currents are zero
     end
     
     methods
         % constructor
-        function obj = Antenna(dir, N, freq, epi_r, mu_r, E_inc, E_vect)
-            added_path = [pwd '\' dir];         % choose folder for antenna geometry
+        function obj = Antenna(dir, N, freq, epi_r, mu_r, E_inc, E_vect, assump)
+            added_path = [pwd '\' dir];           % choose folder for antenna geometry
             addpath(added_path);
+            
             obj.N = N;
             obj.c =  1/sqrt(obj.mu_0*obj.epi_0);  % vacuum speed of light
             obj.epi_r = epi_r;
             obj.mu_r = mu_r;
-            obj.omega = 2*pi*freq;  % operating frequency
-            obj.k = obj.omega*sqrt(obj.epi_0*epi_r*obj.mu_0*mu_r);                  % k vector
+            obj.omega = 2*pi*freq;                % operating frequency
+            obj.k = obj.omega*sqrt(obj.epi_0*epi_r*obj.mu_0*mu_r); % k vector
             
             obj.E_inc = E_inc;
             obj.E_vect = E_vect;
+            
+            obj.assump = assump;
             
             % length of each segment
             del_l = segVect(obj.N, 1, 0, 1, 0);        
@@ -50,9 +54,10 @@ classdef Antenna
             [~, obj.a] = segLoc(obj.N, 1, 0);
             obj.Z = calcZ(obj);
             obj.V = calcV(obj);
-            obj.I = calcI(obj);
+            obj.I = calcI(obj, assump);
            
             obj.ZWire = calcZWire(obj);         % impedance of antenna, per segment
+            obj.inputIm = calcInputIm(obj, assump);
             obj.QFactor = calcQFactor(obj);     % Q factor of antenna
             obj.ind = calcInd(obj);             % inductance of antenna (j*omega*L)
 
@@ -66,7 +71,6 @@ classdef Antenna
             del_l = obj.del_l;
             k = obj.k;
             a = obj.a;
-            cornerLimit = obj.cornerLimit;
             omega = obj.omega;
             epi_0 = obj.epi_0;
             mu_0 = obj.mu_0;
@@ -74,7 +78,8 @@ classdef Antenna
             % matrices to track row and column indices of each element for basis and
             % testing functions
             [colCountM, rowCountM] = meshgrid(1:M, 1:M);
-            % normalize column and row matrixes so that [0,M+1] -> [-1,1]
+            % normalize column and row matrixes so that [1,M] -> [-1+1/M,1-1/M]
+            % needed to use for integral approximation using riemann sums
             colCountMNorm = norm(colCountM, M);
             rowCountMNorm = norm(rowCountM, M);
 
@@ -92,7 +97,6 @@ classdef Antenna
             % m != n Kernal
             K_pq = @(m, offsetM, n, offsetN) exp(-1i*k*Rmn(N, m, offsetM, n, offsetN))...
                     /(4*pi*Rmn(N, m, offsetM, n, offsetN));
-            % rowCount*2/(M+1)-1 changes [1,M] to [-1+2/(M+1),1-2/(M+1)]
             G_pq = @(m,n) arrayfun(K_pq, repmat(m,M), rowCountMNorm, repmat(n,M), colCountMNorm);
 
 
@@ -104,28 +108,53 @@ classdef Antenna
 
             % width of each Riemann sum column
             sampleWidth = repmat(2*del_l/M, M);
-
-            % impedance matrix term
+            % first and last segments require half triangles as bases
+            startEdge = [zeros(M/2,M); ones(M/2, M)];
+            endEdge = [ones(M/2, M); zeros(M/2, M)];
+            
+            % impedance MxM matrix terms
             ZmnMatrix = @(m,n) G_pq(m,n).*(sampleWidth.^2).*(1i*omega*mu_0*basisProd.*dotProd(m,n)...
                 -1i/(omega*epi_0)*basisDerProd);
-
+            
+            % impedance NxN matrix terms
             Zmn = @(m,n) sum(sum(ZmnMatrix(m,n)));
+            % special scenerios for beginning and end segments due to 
+            % half triangle approximation
+            ZmnTop = @(m,n) sum(sum(startEdge.*ZmnMatrix(m,n)));
+            ZmnBottom = @(m,n) sum(sum(endEdge.*ZmnMatrix(m,n)));
+            ZmnLeft = @(m,n) sum(sum(transpose(startEdge).*ZmnMatrix(m,n)));
+            ZmnRight = @(m,n) sum(sum(transpose(endEdge).*ZmnMatrix(m,n)));
+            ZmnTopLeft = @(m,n) sum(sum(startEdge.*transpose(startEdge).*ZmnMatrix(m,n)));
+            ZmnTopRight = @(m,n) sum(sum(startEdge.*transpose(endEdge).*ZmnMatrix(m,n)));
+            ZmnBottomLeft = @(m,n) sum(sum(endEdge.*transpose(startEdge).*ZmnMatrix(m,n)));
+            ZmnBottomRight = @(m,n) sum(sum(endEdge.*transpose(endEdge).*ZmnMatrix(m,n)));
 
             % matrices to track row and column indices of each basis function
             [colCountN, rowCountN] = meshgrid(2:N, 2:N);
 
+            Z = zeros(N+1,N+1);
             % unmodified Z matrix with no self terms
-            Z = arrayfun(Zmn, rowCountN, colCountN);
+            Z(2:N, 2:N) = arrayfun(Zmn, rowCountN, colCountN);
+            Z(1, 2:N) = arrayfun(ZmnTop, repmat(1, 1, N-1), 2:N);
+            Z(N+1, 2:N) = arrayfun(ZmnBottom, repmat(N+1, 1, N-1), 2:N);
+            Z(2:N, 1) = arrayfun(ZmnLeft, 2:N, repmat(1, 1, N-1));
+            Z(2:N, N+1) = arrayfun(ZmnRight, 2:N, repmat(N+1, 1, N-1));
+            Z(1,1) = ZmnTopLeft(1,1);
+            Z(1, N+1) = ZmnTopRight(1, N+1);
+            Z(N+1, 1) = ZmnBottomLeft(N+1, 1);
+            Z(N+1, N+1) = ZmnBottomRight(N+1, N+1);
             %%
             %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
             % calculate self term contributions
-            % basis for a complete triangle [-1,1]
-            M1 = 1*M;
-            basisAsc =  norm([M1/2+1:M1],M1);
-            sampleWidth1 = repmat(2*del_l/M1, 1, length(basisAsc));
-            % ascending traingle function [0,del_l]
+            % basis for an ascending triangle [0,1]
+            basisAsc =  norm([M/2+1:M],M);
+            sampleWidth1 = repmat(2*del_l/M, 1, length(basisAsc));
+            % ascending triangle function [0,del_l]
             selfCount = basisAsc*del_l;
 
+            % equivalent radius for self-terms
+            a=a*(1-0.40976*a/del_l);
+            
             % x is observation point[-del_l, del_l]
             S1 = @(x) 1/del_l*sqrt(a^2+(x-del_l)^2)-1/del_l*sqrt(a^2+x^2)+...
                 x/del_l*log((sqrt(a^2+(x-del_l)^2)-x+del_l)/(sqrt(a^2+x^2)-x))-1i*k*del_l/2;
@@ -139,11 +168,10 @@ classdef Antenna
             S2 = @(x) 1/(del_l^2)*(log((x+sqrt(a^2+x^2))/(x-del_l+sqrt(a^2+(x-del_l)^2)))-1i*k*del_l);
             selfS2 = arrayfun(S2, selfCount);
 
-            % funcSign = -1 when derivatives of source and testing functions are of
+            % -1 slope when derivatives of source and testing functions are of
             % opposing sign
-            % funcSign = 1 when derivatives of source and testing functions are of
+            % 1 slope when derivatives of source and testing functions are of
             % the same sign
-
             selfMMatrix1 = 1/(4*pi)*sampleWidth1.*...
                 (1i*omega*mu_0*arrayfun(@f, basisAsc).*selfS1-1i/(omega*epi_0)*(-selfS2));
 
@@ -155,56 +183,49 @@ classdef Antenna
             % calculate Zmn impedance
             
             % which terms in the NxN matrix have overlapping segments
-            mnOverlapN = full(spdiags(ones(N-1), 1, N-1, N-1));       % m+1=n
-            nnOverlapN = full(spdiags(ones(N-1), 0, N-1, N-1));       % m=n
-            nmOverlapN = full(spdiags(ones(N-1), -1, N-1, N-1));       % m=n+1
+            mnOverlapN = full(spdiags(ones(N+1), 1, N+1, N+1));       % m+1=n
+            nnOverlapN = full(spdiags(ones(N+1), 0, N+1, N+1));       % m=n
+            nmOverlapN = full(spdiags(ones(N+1), -1, N+1, N+1));       % m=n+1
 
             % which terms in the MxM sampling matrix correspond to overlapping segments
             % all observation points for given source segment
-            nmOverlapM = [zeros(M/2, M/2), ones(M/2, M/2); zeros(M/2, M)];
-            nnOverlapM = [ones(M/2, M/2), zeros(M/2,M/2); zeros(M/2,M/2), ones(M/2, M/2)];
             mnOverlapM = [zeros(M/2, M); ones(M/2, M/2), zeros(M/2, M/2)];
+            nnOverlapM = [ones(M/2, M/2), zeros(M/2,M/2); zeros(M/2,M/2), ones(M/2, M/2)];
+            nmOverlapM = [zeros(M/2, M/2), ones(M/2, M/2); zeros(M/2, M)];
 
             % calculate Z terms with overlapping segments
             ZmnOverlap = @(m,n) sum(sum(ZmnMatrix(m,n).*(1-mnOverlapM)))+sum(sum(selfMMatrix1));
-            ZnnOverlap = @(m,n) sum(sum(ZmnMatrix(m,n).*(1-nnOverlapM)))+sum(sum(2*selfMMatrix2));
+            ZnnOverlap = @(m,n) sum(sum(ZmnMatrix(m,n).*(1-nnOverlapM)))+2*sum(sum(selfMMatrix2));
             ZnmOverlap = @(m,n) sum(sum(ZmnMatrix(m,n).*(1-nmOverlapM)))+sum(sum(selfMMatrix1));
 
-            ZOverlap = zeros(N-1);
+            ZOverlap = zeros(N+1);
             % recalculate all matrix values that have self terms
-            for i = 2:N-2
-                ZOverlap(i, i-1) = ZnmOverlap(i+1, i);
-                ZOverlap(i, i+1) = ZmnOverlap(i+1, i+2);
-
-                checkCorner = dotProd(i+1, i+1);            % check if there is corner
-                cornerCos = checkCorner(1,end);             % in segment
-
-                % no corner in segment
-%                 if 1-abs(cornerCos) < cornerLimit
-                    ZOverlap(i, i) = ZnnOverlap(i+1, i+1);   
-%                 else
-%                     fprintf('index %f: cos: %f\n', i, cornerCos);
-            %         ZOverlap(i, i) = 2*sum(sum(selfMMatrix(1))) + 2*cornerCos*sum(sum(selfMMatrix(-1)));
-%                     ZOverlap(i, i) = ZOverlap(i-1, i-1);
-%                 end
+            for i = 2:N
+                ZOverlap(i, i-1) = ZnmOverlap(i, i-1);
+                ZOverlap(i, i+1) = ZmnOverlap(i, i+1);
+                ZOverlap(i, i) = ZnnOverlap(i, i);   
             end
-            ZOverlap(1,1) = ZnnOverlap(2,2);
-            ZOverlap(1,2) = ZmnOverlap(2,3);
-            ZOverlap(N-1,N-1) = ZnnOverlap(N,N);
-            ZOverlap(N-1,N-2) = ZnmOverlap(N,N-1);
+            % beginning and end segments with the half triangle basis must
+            % be specially calculated
+            ZOverlap(1,1) = sum(sum(selfMMatrix2));
+            ZOverlap(1,2) = sum(sum(ZmnMatrix(1,2).*(1-mnOverlapM).*startEdge))+sum(sum(selfMMatrix1));
+            ZOverlap(2,1) = sum(sum(ZmnMatrix(2,1).*(1-nmOverlapM).*transpose(startEdge)))+sum(sum(selfMMatrix1));
+            ZOverlap(N+1,N+1) = sum(sum(selfMMatrix2));
+            ZOverlap(N,N+1) = sum(sum(ZmnMatrix(N,N+1).*(1-mnOverlapM).*transpose(endEdge)))+sum(sum(selfMMatrix1));
+            ZOverlap(N+1,N) = sum(sum(ZmnMatrix(N+1,N).*(1-nmOverlapM).*endEdge))+sum(sum(selfMMatrix1));
+            
             assignin('base', 'ZBefore', Z);   % expose variable value to workspace 
 
             % complete Z matrix with updated self terms
             Z = Z.*(1-(mnOverlapN+nnOverlapN+nmOverlapN))+ ZOverlap;
 
-%             Z = Z+diag(diag(Z));
             ZAbs = abs(Z);
 
             assignin('base', 'ZAbs', ZAbs);   % expose variable value to workspace 
             assignin('base', 'ZOverlap', ZOverlap);   % expose variable value to workspace 
         end
         
-        % calculate the antenna's potential induced by the incident field
+        % calculate the antenna's potential 
         function V = calcV(obj)
             omega = obj.omega;
             mu_0 = obj.mu_0;
@@ -221,19 +242,38 @@ classdef Antenna
 
             bm = @(m) sum(sum(sampleWidth.*(basis.*segVectDot(N, m,...
                 rowCountMNorm(:,1)-1/(M+1), rowCountMNorm(:,1)+1/(M+1), E_inc*E_vect))));
-            V = arrayfun(bm,transpose(2:N));
+            V = arrayfun(bm,transpose(1:N+1));
+            V(1) = V(1)/2;
+            V(end) = V(end)/2;
             
-%             bm1 = sum(sum(sampleWidth.*(basis*1/del_l)));
-%             V = zeros(N-1,1);
-%             V(ceil(N/2)) = bm1/2;
-%             V(floor(N/2)) = bm1/2;
+         
+            V = zeros(N+1,1);
+            bm1 = sum(sum(sampleWidth.*(basis*1/del_l)));
+            
+            V(ceil((N+2)/2)) = V(ceil((N+2)/2)) + bm1/2;
+            V(floor((N+2)/2)) = V(floor((N+2)/2)) + bm1/2;
+
 %             V(1) = bm1/2;
 %             V(end) = bm1/2;
+
+%             V(1) = bm1/2;
+%             V(end) = -bm1/2;
+            
+%             V(1) = bm1;
         end
         
         % calculate current distribution
-        function I = calcI(obj)
-            I =  obj.Z\obj.V; 
+        function I = calcI(obj, typeAssume)
+            N = obj.N;
+            
+            I = zeros(N+1,1);
+            % assume end currents are zero
+            if typeAssume == 0
+                I(2:N) =  obj.Z(2:N, 2:N)\obj.V(2:N); 
+            else
+                I =  obj.Z\obj.V; 
+            end
+
         end
         
         % calculate impedance of each segment along antenna
@@ -242,13 +282,24 @@ classdef Antenna
         end
         
         % calculate total q factor
+        function inputIm = calcInputIm(obj, assump)
+            N = obj.N;
+            
+            if assump == 0
+                inputIm = sum(obj.ZWire(2:N)); 
+            else
+                inputIm = sum(obj.ZWire);
+            end
+        end
+        
+        % calculate total q factor
         function QFactor = calcQFactor(obj)
-           QFactor = abs(imag(obj.ZWire)/real(obj.ZWire)); 
+            QFactor = abs(imag(obj.inputIm)/real(obj.inputIm));
         end
         
         % calculate inductance of antenna
         function ind = calcInd(obj)
-           ind = imag(obj.ZWire)/obj.omega;
+           ind = -imag(obj.inputIm)/obj.omega;
         end
         
         % plot current distribution
@@ -259,7 +310,7 @@ classdef Antenna
             %plot current distribution
             figure(1);
 %             plot(1/(length(I)-1)*(0:length(I)-1), abs(I));
-            plot((1:length(I))/N-1/2, abs(I));
+            plot(((1:length(I))-1/2)/(N+1), abs(I));
             xlabel('Segment Location');
             ylabel('Current (I)');
             % title('\bf blah')
@@ -301,7 +352,8 @@ classdef Antenna
             grid on;
         end
 
-        % plot e field impinging on plane
+        % plot field impinging on plane
+        % fType: 1-calculate h field, 0-calculate e field
         function plotField(obj, xIn, yIn, zIn, fType)
             N = obj.N;
             del_l = obj.del_l;
